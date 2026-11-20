@@ -1,0 +1,8 @@
+.env
+auth/
+out/
+node_modules/
+*.log
+*.zip
+*.bundle
+entrega/
