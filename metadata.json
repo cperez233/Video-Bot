@@ -1,0 +1,5 @@
+{
+  "name": "Video Bot Studio",
+  "description": "Extractor multimedia y panel de control para bot personal de WhatsApp (Baileys): YouTube, X, TikTok, Instagram y Reddit con compresión FFmpeg, QR y Pairing Code.",
+  "requestFramePermissions": []
+}

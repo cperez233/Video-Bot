@@ -1,4 +1,4 @@
-// lib.js — lógica del bot sin WhatsApp: detectar link, yt-dlp, ffmpeg, formateo.
+// lib.js — lógica del bot sin WhatsApp: detectar links, comandos, yt-dlp, ffmpeg, caché y formateo.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
@@ -7,54 +7,240 @@ import { randomBytes } from 'node:crypto';
 
 const exec = promisify(execFile);
 
-const YTDLP = process.env.YTDLP_BIN || 'yt-dlp';
-const FFMPEG = process.env.FFMPEG_BIN || 'ffmpeg';
-const FFPROBE = process.env.FFPROBE_BIN || 'ffprobe';
-
 export const WA_VIDEO_LIMIT = 16 * 1024 * 1024; // límite práctico de WhatsApp para video
 const VIDEO_TARGET = Math.floor(WA_VIDEO_LIMIT * 0.92); // margen de seguridad (~14.7 MB)
-const MAX_DOC_BYTES = Number(process.env.MAX_DOC_MB || 100) * 1024 * 1024;
-const MAX_DURATION_S = Number(process.env.MAX_DURATION_MIN || 20) * 60;
 const CAPTION_MAX = 1024;
 const TOP_COMMENTS = 5;
 const COMMENT_MAX_CHARS = 300;
 
+// ───────────────────────── Configuración en caliente ─────────────────────────
+
+const runtimeConfig = {
+  maxDurationMin: Number(process.env.MAX_DURATION_MIN || 20) || 20,
+  maxDocMb: Number(process.env.MAX_DOC_MB || 100) || 100,
+  ytdlpCookies: process.env.YTDLP_COOKIES || '',
+  ytdlpBin: process.env.YTDLP_BIN || 'yt-dlp',
+  ffmpegBin: process.env.FFMPEG_BIN || 'ffmpeg',
+  ffprobeBin: process.env.FFPROBE_BIN || 'ffprobe',
+};
+
+export function getRuntimeConfig() {
+  return { ...runtimeConfig };
+}
+
+export function updateRuntimeConfig(patch = {}) {
+  if (patch.maxDurationMin !== undefined) {
+    const n = Number(patch.maxDurationMin);
+    if (Number.isFinite(n) && n >= 1 && n <= 180) runtimeConfig.maxDurationMin = Math.round(n);
+  }
+  if (patch.maxDocMb !== undefined) {
+    const n = Number(patch.maxDocMb);
+    if (Number.isFinite(n) && n >= 5 && n <= 500) runtimeConfig.maxDocMb = Math.round(n);
+  }
+  if (patch.ytdlpCookies !== undefined) {
+    runtimeConfig.ytdlpCookies = String(patch.ytdlpCookies || '').trim();
+  }
+  if (patch.ytdlpBin !== undefined && String(patch.ytdlpBin).trim()) {
+    runtimeConfig.ytdlpBin = String(patch.ytdlpBin).trim();
+  }
+  if (patch.ffmpegBin !== undefined && String(patch.ffmpegBin).trim()) {
+    runtimeConfig.ffmpegBin = String(patch.ffmpegBin).trim();
+  }
+  if (patch.ffprobeBin !== undefined && String(patch.ffprobeBin).trim()) {
+    runtimeConfig.ffprobeBin = String(patch.ffprobeBin).trim();
+  }
+  return getRuntimeConfig();
+}
+
+export const SUPPORTED_PLATFORMS = ['youtube', 'x', 'instagram', 'tiktok', 'reddit'];
+
 // ───────────────────────── Detección de links ─────────────────────────
 
-/** Devuelve null si el texto no tiene link; si no, {kind, url}. kind: youtube | x | unsupported */
-export function parseLink(text) {
-  const m = text?.match(/https?:\/\/[^\s<>]+/i);
-  if (!m) return null;
+function classifyUrl(rawUrl) {
   let u;
   try {
-    u = new URL(m[0].replace(/[).,;!?]+$/, ''));
+    u = new URL(rawUrl.replace(/[).,;!?\]"']+$/, ''));
   } catch {
-    return { kind: 'unsupported', url: m[0] };
+    return { kind: 'unsupported', url: rawUrl };
   }
-  const host = u.hostname.toLowerCase().replace(/^(www|m|mobile|music)\./, '');
+  const host = u.hostname.toLowerCase().replace(/^(www|m|mobile|music|old|np)\./, '');
   const parts = u.pathname.split('/').filter(Boolean);
 
+  // YouTube
   if (host === 'youtu.be' && parts[0]) {
-    return { kind: 'youtube', url: `https://www.youtube.com/watch?v=${parts[0]}` };
+    return { kind: 'youtube', url: `https://www.youtube.com/watch?v=${parts[0]}`, id: parts[0] };
   }
   if (host === 'youtube.com') {
     if (parts[0] === 'watch' && u.searchParams.get('v')) {
-      return { kind: 'youtube', url: `https://www.youtube.com/watch?v=${u.searchParams.get('v')}` };
+      const id = u.searchParams.get('v');
+      return { kind: 'youtube', url: `https://www.youtube.com/watch?v=${id}`, id };
     }
     if (['shorts', 'live', 'embed'].includes(parts[0]) && parts[1]) {
-      return { kind: 'youtube', url: `https://www.youtube.com/watch?v=${parts[1]}` };
+      return { kind: 'youtube', url: `https://www.youtube.com/watch?v=${parts[1]}`, id: parts[1] };
     }
   }
-  if (['x.com', 'twitter.com'].includes(host)) {
+
+  // X / Twitter
+  if (['x.com', 'twitter.com', 'fxtwitter.com', 'vxtwitter.com'].includes(host)) {
     const i = parts.indexOf('status');
     if (i >= 0 && /^\d+$/.test(parts[i + 1] || '')) {
-      return { kind: 'x', url: `https://x.com/${parts[0] === 'i' ? 'i' : parts[0]}/status/${parts[i + 1]}`, id: parts[i + 1] };
+      const user = parts[0] === 'i' || !parts[0] ? 'i' : parts[0];
+      return { kind: 'x', url: `https://x.com/${user}/status/${parts[i + 1]}`, id: parts[i + 1] };
     }
   }
+
+  // Instagram
+  if (host === 'instagram.com' || host === 'ddinstagram.com') {
+    if (['reel', 'reels', 'p', 'tv'].includes(parts[0]) && parts[1]) {
+      const segment = parts[0] === 'reels' ? 'reel' : parts[0];
+      return { kind: 'instagram', url: `https://www.instagram.com/${segment}/${parts[1]}/`, id: parts[1] };
+    }
+    if (parts[0] === 'stories' && parts[1] && parts[2]) {
+      return { kind: 'instagram', url: `https://www.instagram.com/stories/${parts[1]}/${parts[2]}/`, id: parts[2] };
+    }
+  }
+
+  // TikTok
+  if (host === 'tiktok.com') {
+    if (parts[0]?.startsWith('@') && ['video', 'photo'].includes(parts[1]) && /^\d+$/.test(parts[2] || '')) {
+      return { kind: 'tiktok', url: `https://www.tiktok.com/${parts[0]}/${parts[1]}/${parts[2]}`, id: parts[2] };
+    }
+    if (parts[0] === 't' && parts[1]) {
+      return { kind: 'tiktok', url: `https://www.tiktok.com/t/${parts[1]}`, id: parts[1] };
+    }
+  }
+  if (['vm.tiktok.com', 'vt.tiktok.com'].includes(host) && parts[0]) {
+    return { kind: 'tiktok', url: `https://${host}/${parts[0]}`, id: parts[0] };
+  }
+
+  // Reddit
+  if (host === 'reddit.com') {
+    if (parts[0] === 'r' && parts[1] && parts[2] === 'comments' && parts[3]) {
+      return { kind: 'reddit', url: `https://www.reddit.com/r/${parts[1]}/comments/${parts[3]}/`, id: parts[3] };
+    }
+    if (parts[0] === 'r' && parts[1] && parts[2] === 's' && parts[3]) {
+      return { kind: 'reddit', url: `https://www.reddit.com/r/${parts[1]}/s/${parts[3]}`, id: parts[3] };
+    }
+  }
+  if (host === 'redd.it' && parts[0]) {
+    return { kind: 'reddit', url: `https://redd.it/${parts[0]}`, id: parts[0] };
+  }
+
   return { kind: 'unsupported', url: u.href };
 }
 
-// ───────────────────────── Lista blanca ─────────────────────────
+/** Devuelve todos los links detectados en el texto (sin duplicados por URL). */
+export function parseLinks(text) {
+  if (!text) return [];
+  const matches = String(text).match(/https?:\/\/[^\s<>]+/gi);
+  if (!matches) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of matches) {
+    const parsed = classifyUrl(raw);
+    if (!seen.has(parsed.url)) {
+      seen.add(parsed.url);
+      out.push(parsed);
+    }
+  }
+  return out;
+}
+
+/** Devuelve null si el texto no tiene link; si no, el primer {kind, url}. */
+export function parseLink(text) {
+  const links = parseLinks(text);
+  return links.length ? links[0] : null;
+}
+
+// ───────────────────────── Comandos de mensaje y recorte ─────────────────────────
+
+/** Convierte "mm:ss" o "hh:mm:ss" en segundos. Devuelve null si es inválido. */
+export function parseTimestampToSeconds(ts) {
+  const m = String(ts || '').trim().match(/^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = m[1] ? Number(m[1]) : 0;
+  const min = Number(m[2]);
+  const sec = Number(m[3]);
+  if (min >= 60 && m[1]) return null;
+  if (sec >= 60) return null;
+  return h * 3600 + min * 60 + sec;
+}
+
+export function formatSecondsToTimestamp(totalSec) {
+  const s = Math.max(0, Math.floor(totalSec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(rem)}` : `${m}:${pad(rem)}`;
+}
+
+/** Parsea un rango de recorte tipo "0:15-0:45" o "1:00 - 1:30". */
+export function parseTrimRange(text) {
+  const m = String(text || '').match(/\b((?:\d{1,2}:)?\d{1,2}:\d{2})\s*[-–]\s*((?:\d{1,2}:)?\d{1,2}:\d{2})\b/);
+  if (!m) return null;
+  const startSec = parseTimestampToSeconds(m[1]);
+  const endSec = parseTimestampToSeconds(m[2]);
+  if (startSec == null || endSec == null || endSec <= startSec) return null;
+  return {
+    raw: `${m[1]}-${m[2]}`,
+    start: formatSecondsToTimestamp(startSec),
+    end: formatSecondsToTimestamp(endSec),
+    startSec,
+    endSec,
+    durationSec: endSec - startSec,
+  };
+}
+
+/**
+ * Analiza un mensaje completo para detectar links, modo (video | audio | document) y recorte opcional.
+ */
+export function parseMessageCommand(text) {
+  const links = parseLinks(text);
+  const withoutUrls = String(text || '').replace(/https?:\/\/[^\s<>]+/gi, ' ');
+  const trim = parseTrimRange(withoutUrls);
+  let mode = 'video';
+  if (/(?:^|\s)(?:!?(?:audio|mp3)|voz)(?=\s|$)/i.test(withoutUrls)) {
+    mode = 'audio';
+  } else if (/(?:^|\s)(?:!?(?:doc|hd|documento)|original)(?=\s|$)/i.test(withoutUrls)) {
+    mode = 'document';
+  }
+  return { links, mode, trim };
+}
+
+/**
+ * Parsea comandos administrativos enviados por chat:
+ *   /allow <numero>, /remove <numero>, /limit <minutos>, /status, /help
+ */
+export function parseAdminCommand(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed.startsWith('/')) return null;
+  const [rawCmd, ...rest] = trimmed.split(/\s+/);
+  const cmd = rawCmd.slice(1).toLowerCase();
+  const arg = rest.join(' ').trim();
+
+  if (cmd === 'allow' || cmd === 'add') {
+    const phone = normalizePhone(arg);
+    return { cmd: 'allow', phone, valid: phone.length >= 8 };
+  }
+  if (cmd === 'remove' || cmd === 'revoke' || cmd === 'del') {
+    const phone = normalizePhone(arg);
+    return { cmd: 'remove', phone, valid: phone.length >= 8 };
+  }
+  if (cmd === 'limit') {
+    const minutes = Number(arg);
+    return { cmd: 'limit', minutes, valid: Number.isFinite(minutes) && minutes >= 1 && minutes <= 180 };
+  }
+  if (cmd === 'status' || cmd === 'estado') {
+    return { cmd: 'status', valid: true };
+  }
+  if (cmd === 'help' || cmd === 'ayuda') {
+    return { cmd: 'help', valid: true };
+  }
+  return null;
+}
+
+// ───────────────────────── Lista blanca y grupos ─────────────────────────
 
 /** Solo dígitos; los móviles de México pueden venir como 521XXXXXXXXXX o 52XXXXXXXXXX → unificamos a 52XXXXXXXXXX. */
 export function normalizePhone(v) {
@@ -63,19 +249,36 @@ export function normalizePhone(v) {
 }
 
 /**
- * ¿Mensaje de un número autorizado? `jids` son todas las identidades conocidas del remitente
- * (remoteJid, remoteJidAlt, número resuelto desde LID). Los mensajes fromMe solo valen en el chat
- * "mensaje a mí mismo" (si no, serían las respuestas del propio bot).
+ * ¿Mensaje de un número o grupo autorizado?
+ * En 1:1: el remitente debe estar en `allowed` (y `fromMe` solo vale en el chat "mensaje a mí mismo").
+ * En grupos: requiere `allowGroups: true`, grupo autorizado (si `allowedGroups` tiene elementos),
+ * y que el participante esté en `allowed` o el bot haya sido mencionado (`mentionedMe`).
  */
-export function isAllowedSender({ allowed, jids, ownId, fromMe }) {
+export function isAllowedSender({
+  allowed,
+  allowedGroups = new Set(),
+  allowGroups = false,
+  jids = [],
+  ownId,
+  fromMe = false,
+  isGroup = false,
+  groupJid = '',
+  mentionedMe = false,
+}) {
+  if (isGroup) {
+    if (!allowGroups) return false;
+    if (allowedGroups.size > 0 && !allowedGroups.has(groupJid)) return false;
+    const nums = jids.filter((j) => j && !String(j).endsWith('@lid')).map(normalizePhone);
+    if (nums.some((n) => allowed.has(n))) return true;
+    return Boolean(mentionedMe);
+  }
   const nums = jids.filter((j) => j && !String(j).endsWith('@lid')).map(normalizePhone);
   if (!nums.some((n) => allowed.has(n))) return false;
   return fromMe ? nums.includes(normalizePhone(ownId)) : true;
 }
 
 /**
- * Registro de los mensajes que envía el propio bot. Sirve para ignorarlos al volver como eventos
- * (en el chat "mensaje a mí mismo" llegan como mensajes propios; si traían un link, el bot se respondería solo).
+ * Registro de los mensajes que envía el propio bot para no entrar en bucle.
  */
 export function createSentTracker(max = 1000) {
   const ids = new Set();
@@ -90,6 +293,43 @@ export function createSentTracker(max = 1000) {
   };
 }
 
+/**
+ * Caché temporal en memoria por URL + modo + recorte para evitar descargas duplicadas.
+ */
+export function createResultCache(ttlMs = 15 * 60_000, maxEntries = 50) {
+  const map = new Map();
+  return {
+    makeKey(url, mode = 'video', trimRaw = '') {
+      return `${url}|${mode}|${trimRaw || ''}`;
+    },
+    get(key, now = Date.now()) {
+      const item = map.get(key);
+      if (!item) return null;
+      if (now > item.expiresAt) {
+        map.delete(key);
+        return null;
+      }
+      return item.value;
+    },
+    set(key, value, now = Date.now()) {
+      map.delete(key);
+      map.set(key, { value, expiresAt: now + ttlMs });
+      if (map.size > maxEntries) {
+        map.delete(map.keys().next().value);
+      }
+    },
+    clear() {
+      map.clear();
+    },
+    size(now = Date.now()) {
+      for (const [k, v] of map.entries()) {
+        if (now > v.expiresAt) map.delete(k);
+      }
+      return map.size;
+    },
+  };
+}
+
 // ───────────────────────── Utilidades ─────────────────────────
 
 const fmtNum = (n) => (Number.isFinite(n) ? n.toLocaleString('es-MX') : '?');
@@ -99,12 +339,11 @@ function truncate(s, max) {
   return s.length <= max ? s : s.slice(0, max - 1).trimEnd() + '…';
 }
 
-export function buildCaption({ title, byline, likes }) {
-  const footer = `\n\n👍 ${fmtNum(likes)}`;
-  // negrita solo si el título es de una línea (WhatsApp no aplica *…* a través de saltos de línea)
+export function buildCaption({ title, byline, likes, platform }) {
+  const platformTag = platform ? `${platform} · ` : '';
+  const footer = `\n\n${platformTag}👍 ${fmtNum(likes)}`;
   const clean = (title || '').replace(/\*/g, '').trim();
   const head = [clean && (clean.includes('\n') ? clean : `*${clean}*`), byline].filter(Boolean).join('\n');
-  // el pie de foto manda: recortamos el texto, nunca los likes
   return truncate(head, CAPTION_MAX - footer.length) + footer;
 }
 
@@ -122,13 +361,32 @@ export function buildCommentsText(comments) {
   return `💬 *Top ${top.length} comentarios*\n\n${lines.join('\n\n')}`;
 }
 
+export function extractTopComments(comments) {
+  return (comments || [])
+    .filter((c) => c && c.text && (c.parent == null || c.parent === 'root'))
+    .sort((a, b) => (b.like_count || 0) - (a.like_count || 0))
+    .slice(0, TOP_COMMENTS)
+    .map((c) => ({
+      author: c.author || 'anónimo',
+      likes: Number(c.like_count || 0),
+      text: truncate(c.text.replace(/\s*\n\s*/g, ' '), COMMENT_MAX_CHARS),
+    }));
+}
+
 async function ytdlp(args, opts = {}) {
   const base = ['--no-playlist', '--js-runtimes', 'node'];
-  if (process.env.YTDLP_COOKIES) base.push('--cookies', process.env.YTDLP_COOKIES); // opcional: cookies.txt de tu navegador
+  if (runtimeConfig.ytdlpCookies) base.push('--cookies', runtimeConfig.ytdlpCookies);
   try {
-    const { stdout } = await exec(YTDLP, [...base, ...args], { maxBuffer: 256 * 1024 * 1024, timeout: 10 * 60_000, ...opts });
+    const { stdout } = await exec(runtimeConfig.ytdlpBin, [...base, ...args], {
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: 10 * 60_000,
+      ...opts,
+    });
     return stdout;
   } catch (e) {
+    if (e?.code === 'ENOENT') {
+      throw new UserError('yt-dlp no está instalado en este servidor (instálalo con: pip install -U "yt-dlp[default]")');
+    }
     throw new UserError(explainYtdlpError(e.stderr || e.message || ''));
   }
 }
@@ -138,17 +396,19 @@ class UserError extends Error {}
 function explainYtdlpError(stderr) {
   const line = stderr.split('\n').reverse().find((l) => l.includes('ERROR')) || stderr.trim().split('\n').pop() || '';
   const l = line.toLowerCase();
-  if (l.includes('not a bot')) return 'YouTube pide verificar que no soy bot (usa YTDLP_COOKIES con un cookies.txt)';
-  if (stderr.includes('429') || l.includes('429') || l.includes('too many requests')) return 'la plataforma me bloqueó temporalmente (429), intenta más tarde';
-  if (l.includes('private')) return 'el video es privado';
-  if (l.includes('sign in') || l.includes('age')) return 'requiere iniciar sesión / verificar edad';
+  if (l.includes('not a bot')) return 'YouTube pide verificar que no soy bot (configura cookies.txt en el panel)';
+  if (stderr.includes('429') || l.includes('429') || l.includes('too many requests')) return 'la plataforma bloqueó temporalmente las peticiones (429), intenta más tarde';
+  if (l.includes('private')) return 'el contenido es privado';
+  if (l.includes('sign in') || l.includes('login') || l.includes('age')) return 'requiere iniciar sesión o verificar edad';
   if (l.includes('unavailable') || l.includes('not available')) return 'el contenido no está disponible';
   if (l.includes('no video could be found')) return 'NO_VIDEO';
   return truncate(line.replace(/^ERROR:\s*/, ''), 160) || 'error desconocido de yt-dlp';
 }
 
 async function probe(file) {
-  const { stdout } = await exec(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file]);
+  const { stdout } = await exec(runtimeConfig.ffprobeBin, [
+    '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file,
+  ]);
   const j = JSON.parse(stdout);
   const v = j.streams.find((s) => s.codec_type === 'video');
   const a = j.streams.find((s) => s.codec_type === 'audio');
@@ -161,22 +421,81 @@ async function probe(file) {
   };
 }
 
-// ───────────────────────── ffmpeg: que quepa en WhatsApp ─────────────────────────
+// ───────────────────────── ffmpeg: recorte, audio y compresión ─────────────────────────
+
+export async function trimMediaFile(src, dir, trim) {
+  if (!trim) return src;
+  const out = path.join(dir, 'trimmed.mp4');
+  const args = [
+    '-y', '-v', 'error',
+    '-ss', String(trim.startSec),
+    '-to', String(trim.endSec),
+    '-i', src,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '128k',
+    '-movflags', '+faststart',
+    out,
+  ];
+  await exec(runtimeConfig.ffmpegBin, args, { timeout: 10 * 60_000 });
+  return out;
+}
+
+export async function extractAudioFile(src, dir, trim = null) {
+  const out = path.join(dir, 'audio.mp3');
+  const args = [
+    '-y', '-v', 'error',
+    ...(trim ? ['-ss', String(trim.startSec), '-to', String(trim.endSec)] : []),
+    '-i', src,
+    '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-ac', '2',
+    out,
+  ];
+  await exec(runtimeConfig.ffmpegBin, args, { timeout: 10 * 60_000 });
+  const stat = await fs.stat(out);
+  return {
+    path: out,
+    bytes: stat.size,
+    as: 'audio',
+    kind: 'audio',
+    mimetype: 'audio/mpeg',
+    fileName: 'audio.mp3',
+    note: trim ? `audio MP3 recortado (${trim.start}–${trim.end})` : 'audio MP3 extraído (128 kbps)',
+  };
+}
 
 /**
- * Devuelve {path, bytes, as: 'video'|'document', note}.
+ * Devuelve {path, bytes, as: 'video'|'document'|'none', note}.
  * Orden: original si ya cumple → comprimir (hasta 4 intentos) → documento si no cabe.
  */
-export async function fitForWhatsApp(src, dir) {
-  const info = await probe(src);
+export async function fitForWhatsApp(src, dir, { forceDocument = false, trim = null } = {}) {
+  const maxDocBytes = runtimeConfig.maxDocMb * 1024 * 1024;
+  const workingSrc = trim ? await trimMediaFile(src, dir, trim) : src;
+  const trimNote = trim ? ` · recorte ${trim.start}–${trim.end}` : '';
+  const info = await probe(workingSrc);
+
+  if (forceDocument) {
+    if (info.bytes <= maxDocBytes) {
+      return {
+        path: workingSrc,
+        bytes: info.bytes,
+        as: 'document',
+        note: `calidad original como documento (${(info.bytes / 1048576).toFixed(1)} MB)${trimNote}`,
+      };
+    }
+    return {
+      path: null,
+      bytes: info.bytes,
+      as: 'none',
+      note: `excede el límite de documento (${(info.bytes / 1048576).toFixed(0)} MB > ${runtimeConfig.maxDocMb} MB)`,
+    };
+  }
+
   const waOk = info.vcodec === 'h264' && (!info.acodec || info.acodec === 'aac');
   if (info.bytes <= VIDEO_TARGET && waOk) {
-    return { path: src, bytes: info.bytes, as: 'video', note: 'original (ya cabía)' };
+    return { path: workingSrc, bytes: info.bytes, as: 'video', note: `original (ya cabía)${trimNote}` };
   }
 
   const audioK = info.acodec ? 96 : 0;
-  // bitrate de video que cabe en el presupuesto (con 5% de holgura para el contenedor)
-  let videoK = Math.floor((VIDEO_TARGET * 8 * 0.95) / info.duration / 1000 - audioK);
+  let videoK = Math.floor((VIDEO_TARGET * 8 * 0.95) / Math.max(info.duration || 1, 1) / 1000 - audioK);
   const MIN_VIDEO_K = 100;
 
   if (videoK >= MIN_VIDEO_K) {
@@ -184,7 +503,7 @@ export async function fitForWhatsApp(src, dir) {
     for (let attempt = 1; attempt <= 4; attempt++) {
       const h = videoK >= 1200 ? 720 : videoK >= 500 ? 480 : videoK >= 250 ? 360 : 240;
       const args = [
-        '-y', '-v', 'error', '-i', src,
+        '-y', '-v', 'error', '-i', workingSrc,
         '-vf', `scale=-2:'min(${h},ih)'`,
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26',
         '-maxrate', `${videoK}k`, '-bufsize', `${videoK * 2}k`, '-pix_fmt', 'yuv420p',
@@ -192,32 +511,47 @@ export async function fitForWhatsApp(src, dir) {
         '-movflags', '+faststart', out,
       ];
       try {
-        await exec(FFMPEG, args, { timeout: 15 * 60_000 });
+        await exec(runtimeConfig.ffmpegBin, args, { timeout: 15 * 60_000 });
       } catch {
-        break; // ffmpeg falló: caemos al documento
+        break;
       }
       const { bytes } = await probe(out);
       if (bytes <= VIDEO_TARGET) {
-        return { path: out, bytes, as: 'video', note: `comprimido a ${h}p (${(info.bytes / 1048576).toFixed(1)} MB → ${(bytes / 1048576).toFixed(1)} MB, intento ${attempt})` };
+        return {
+          path: out,
+          bytes,
+          as: 'video',
+          note: `comprimido a ${h}p (${(info.bytes / 1048576).toFixed(1)} MB → ${(bytes / 1048576).toFixed(1)} MB, intento ${attempt})${trimNote}`,
+        };
       }
-      videoK = Math.floor(videoK * (VIDEO_TARGET / bytes) * 0.9); // bajar y reintentar
+      videoK = Math.floor(videoK * (VIDEO_TARGET / bytes) * 0.9);
       if (videoK < MIN_VIDEO_K) break;
     }
   }
 
-  if (info.bytes <= MAX_DOC_BYTES) {
-    return { path: src, bytes: info.bytes, as: 'document', note: 'no cupo como video <16 MB; va como documento' };
+  if (info.bytes <= maxDocBytes) {
+    return { path: workingSrc, bytes: info.bytes, as: 'document', note: `no cupo como video <16 MB; va como documento${trimNote}` };
   }
   return { path: null, bytes: info.bytes, as: 'none', note: `no cupo ni como documento (${(info.bytes / 1048576).toFixed(0)} MB)` };
+}
+
+async function processDownloadedMedia(srcPath, dir, { mode = 'video', trim = null } = {}) {
+  if (mode === 'audio') {
+    return extractAudioFile(srcPath, dir, trim);
+  }
+  return fitForWhatsApp(srcPath, dir, { forceDocument: mode === 'document', trim });
 }
 
 // ───────────────────────── Handler YouTube ─────────────────────────
 
 const YT_FORMAT =
   'bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/b[vcodec^=avc1][height<=720]/bv*[height<=720]+ba/b[height<=720]/b';
+const YT_AUDIO_FORMAT = 'ba[acodec^=mp4a]/ba/b';
 
-async function handleYouTube(url, dir) {
-  // 1) metadatos + comentarios (sin descargar el video)
+async function handleYouTube(url, dir, _link, options = {}) {
+  const { mode = 'video', trim = null } = options;
+  const maxDurationS = (mode === 'audio' ? Math.max(runtimeConfig.maxDurationMin * 3, 120) : runtimeConfig.maxDurationMin) * 60;
+
   const stdout = await ytdlp([
     '-J', '--skip-download', '--write-comments',
     '--extractor-args', 'youtube:max_comments=200,200,0,0,0;comment_sort=top',
@@ -228,85 +562,134 @@ async function handleYouTube(url, dir) {
   await fs.writeFile(infoFile, stdout);
 
   const meta = {
+    platform: 'YouTube',
     title: info.title,
     byline: info.channel || info.uploader,
     likes: info.like_count,
+    duration: info.duration,
     comments: info.comments,
     notices: [],
     media: null,
   };
 
-  // 2) video
   if (info.is_live) {
     meta.notices.push('Es un directo; no descargo el video.');
     return meta;
   }
-  if (info.duration > MAX_DURATION_S) {
-    meta.notices.push(`El video dura ${Math.round(info.duration / 60)} min (máx. ${MAX_DURATION_S / 60}); no lo descargo.`);
+  if (!trim && info.duration > maxDurationS) {
+    meta.notices.push(
+      `El video dura ${Math.round(info.duration / 60)} min (máx. ${Math.round(maxDurationS / 60)} min en modo ${mode}); no lo descargo.`,
+    );
     return meta;
   }
+
   const raw = path.join(dir, 'raw');
-  await ytdlp(['--load-info-json', infoFile, '-f', YT_FORMAT, '--merge-output-format', 'mp4', '-o', `${raw}.%(ext)s`, '--no-write-comments']);
+  const format = mode === 'audio' ? YT_AUDIO_FORMAT : YT_FORMAT;
+  const dlArgs = ['--load-info-json', infoFile, '-f', format, '-o', `${raw}.%(ext)s`, '--no-write-comments'];
+  if (mode !== 'audio') dlArgs.push('--merge-output-format', 'mp4');
+  await ytdlp(dlArgs);
+
   const files = (await fs.readdir(dir)).filter((f) => f.startsWith('raw.'));
   if (!files.length) throw new UserError('no se descargó ningún archivo');
-  meta.media = await fitForWhatsApp(path.join(dir, files[0]), dir);
+  meta.media = await processDownloadedMedia(path.join(dir, files[0]), dir, { mode, trim });
   return meta;
 }
 
-
 // ───────────────────────── Handler X (tweets) ─────────────────────────
 
-const decodeEntities = (t) => t.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+const decodeEntities = (t) =>
+  t.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 const xToken = (id) => ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
 
 async function download(url, file) {
   const res = await fetch(url);
-  if (!res.ok) throw new UserError(`no pude bajar la imagen (HTTP ${res.status})`);
+  if (!res.ok) throw new UserError(`no pude bajar el archivo (HTTP ${res.status})`);
   await fs.writeFile(file, Buffer.from(await res.arrayBuffer()));
   return (await fs.stat(file)).size;
 }
 
-// quita los links t.co (X los agrega al final para media y enlaces)
 const cleanTweetText = (t) => decodeEntities((t || '').replace(/\s*https?:\/\/t\.co\/\S+/g, '')).trim();
 
-/** Descarga el video/fotos de un tweet (objeto de sindicación) en `meta`. Devuelve true si había media. */
-async function xMedia(tw, url, dir, meta) {
+function pickBestXVariant(video) {
+  const variants = (video?.video_info?.variants || [])
+    .filter((v) => v?.content_type === 'video/mp4' && v?.url)
+    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  if (!variants.length) return null;
+  // preferir calidad media/720p si existe para no bajar archivos enormes innecesarios
+  const under2Mbps = variants.find((v) => (v.bitrate || 0) <= 2_200_000);
+  return under2Mbps || variants[0];
+}
+
+async function xMedia(tw, url, dir, meta, options = {}) {
+  const { mode = 'video', trim = null } = options;
+  const maxDurationS = (mode === 'audio' ? Math.max(runtimeConfig.maxDurationMin * 3, 120) : runtimeConfig.maxDurationMin) * 60;
   const media = tw.mediaDetails || [];
   const video = media.find((m) => m.type === 'video' || m.type === 'animated_gif');
   if (video) {
-    if (video.video_info?.duration_millis > MAX_DURATION_S * 1000) {
-      meta.notices.push(`El video es demasiado largo (máx. ${MAX_DURATION_S / 60} min); no lo descargo.`);
+    if (!trim && video.video_info?.duration_millis > maxDurationS * 1000) {
+      meta.notices.push(`El video es demasiado largo (máx. ${Math.round(maxDurationS / 60)} min); no lo descargo.`);
       return true;
     }
     const raw = path.join(dir, 'raw');
-    await ytdlp(['-f', 'b[height<=720]/bv*[height<=720]+ba/b', '--merge-output-format', 'mp4', '-o', `${raw}.%(ext)s`, url]);
-    const files = (await fs.readdir(dir)).filter((f) => f.startsWith('raw.'));
-    if (!files.length) throw new UserError('no se descargó ningún archivo');
-    meta.media = await fitForWhatsApp(path.join(dir, files[0]), dir);
+    let downloadedPath = null;
+
+    // Intento directo desde las variantes MP4 del endpoint de sindicación (funciona sin yt-dlp)
+    const variant = pickBestXVariant(video);
+    if (variant?.url) {
+      try {
+        const directFile = `${raw}.mp4`;
+        await download(variant.url, directFile);
+        downloadedPath = directFile;
+      } catch {
+        downloadedPath = null;
+      }
+    }
+
+    if (!downloadedPath) {
+      await ytdlp(['-f', 'b[height<=720]/bv*[height<=720]+ba/b', '--merge-output-format', 'mp4', '-o', `${raw}.%(ext)s`, url]);
+      const files = (await fs.readdir(dir)).filter((f) => f.startsWith('raw.'));
+      if (!files.length) throw new UserError('no se descargó ningún archivo');
+      downloadedPath = path.join(dir, files[0]);
+    }
+
+    meta.media = await processDownloadedMedia(downloadedPath, dir, { mode, trim });
     return true;
   }
+
   const photos = media.filter((m) => m.type === 'photo');
   if (photos.length) {
+    if (mode === 'audio') {
+      meta.notices.push('El tweet solo contiene imágenes; no hay pista de audio que extraer.');
+    }
     const saved = [];
     for (const [i, p] of photos.entries()) {
       const file = path.join(dir, `photo${i}.jpg`);
       saved.push({ path: file, bytes: await download(`${p.media_url_https}?name=large`, file) });
     }
-    meta.media = { as: 'image', kind: 'image', ...saved[0], note: `foto 1/${saved.length}`, mimetype: 'image/jpeg', fileName: 'photo.jpg' };
+    meta.media = {
+      as: 'image',
+      kind: 'image',
+      ...saved[0],
+      note: `foto 1/${saved.length}`,
+      mimetype: 'image/jpeg',
+      fileName: 'photo.jpg',
+    };
     meta.moreImages = saved.slice(1);
     return true;
   }
   return false;
 }
 
-async function handleX(url, dir, link) {
-  // metadatos (texto, likes, tipo de media) desde el endpoint público de embeds
+async function handleX(url, dir, link, options = {}) {
   const res = await fetch(`https://cdn.syndication.twimg.com/tweet-result?id=${link.id}&token=${xToken(link.id)}`);
   if (!res.ok) throw new UserError('el tweet no está disponible');
   const t = await res.json();
-  if (t.__typename !== 'Tweet') throw new UserError('el tweet no está disponible (borrado, privado o con restricción de edad)');
+  if (t.__typename !== 'Tweet') {
+    throw new UserError('el tweet no está disponible (borrado, privado o con restricción de edad)');
+  }
 
   const meta = {
+    platform: 'X',
     title: cleanTweetText(t.text),
     byline: t.user ? `${t.user.name} (@${t.user.screen_name})` : undefined,
     likes: t.favorite_count,
@@ -314,69 +697,166 @@ async function handleX(url, dir, link) {
     notices: [],
     media: null,
   };
-  // las respuestas de X exigen sesión iniciada; sin ella no hay forma fiable de leerlas
-  meta.commentsNote = `X no deja leer comentarios sin iniciar sesión (el tweet tiene ${fmtNum(t.conversation_count)} respuestas).`;
+  meta.commentsNote = `X no permite leer respuestas sin sesión iniciada (el tweet tiene ${fmtNum(t.conversation_count)} respuestas).`;
 
-  let found = await xMedia(t, url, dir, meta);
+  let found = await xMedia(t, url, dir, meta, options);
   if (!found && t.quoted_tweet?.mediaDetails?.length) {
-    // tweet que cita a otro: el video/foto está en el tweet citado
     const q = t.quoted_tweet;
     const qUrl = `https://x.com/${q.user?.screen_name || 'i'}/status/${q.id_str}`;
-    found = await xMedia(q, qUrl, dir, meta);
-    if (found) meta.notices.push(`↪️ Media del tweet citado de @${q.user?.screen_name}: ${truncate(cleanTweetText(q.text), 200)}`);
+    found = await xMedia(q, qUrl, dir, meta, options);
+    if (found) {
+      meta.notices.push(`↪️ Media del tweet citado de @${q.user?.screen_name}: ${truncate(cleanTweetText(q.text), 200)}`);
+    }
   }
   if (!found) meta.notices.push('El tweet no trae video ni foto.');
+  return meta;
+}
+
+// ───────────────────────── Handler Instagram / TikTok / Reddit ─────────────────────────
+
+const PLATFORM_LABELS = {
+  instagram: 'Instagram',
+  tiktok: 'TikTok',
+  reddit: 'Reddit',
+};
+
+async function handleGenericYtdlp(url, dir, link, options = {}) {
+  const { mode = 'video', trim = null } = options;
+  const maxDurationS = (mode === 'audio' ? Math.max(runtimeConfig.maxDurationMin * 3, 120) : runtimeConfig.maxDurationMin) * 60;
+
+  const stdout = await ytdlp(['-J', '--skip-download', url]);
+  const info = JSON.parse(stdout);
+  const infoFile = path.join(dir, 'info.json');
+  await fs.writeFile(infoFile, stdout);
+
+  const meta = {
+    platform: PLATFORM_LABELS[link.kind] || link.kind,
+    title: info.title || info.description || 'Publicación',
+    byline: info.uploader || info.channel || info.creator,
+    likes: info.like_count,
+    duration: info.duration,
+    comments: info.comments || null,
+    notices: [],
+    media: null,
+  };
+
+  if (!trim && info.duration && info.duration > maxDurationS) {
+    meta.notices.push(`El video dura ${Math.round(info.duration / 60)} min (máx. ${Math.round(maxDurationS / 60)} min); no lo descargo.`);
+    return meta;
+  }
+
+  const raw = path.join(dir, 'raw');
+  const format = mode === 'audio' ? 'ba/b' : 'bv*[height<=720]+ba/b[height<=720]/b';
+  const dlArgs = ['--load-info-json', infoFile, '-f', format, '-o', `${raw}.%(ext)s`];
+  if (mode !== 'audio') dlArgs.push('--merge-output-format', 'mp4');
+  await ytdlp(dlArgs);
+
+  const files = (await fs.readdir(dir)).filter((f) => f.startsWith('raw.'));
+  if (!files.length) throw new UserError('no se descargó ningún archivo');
+  meta.media = await processDownloadedMedia(path.join(dir, files[0]), dir, { mode, trim });
   return meta;
 }
 
 // ───────────────────────── Orquestación ─────────────────────────
 
 /**
- * Procesa un texto con link y devuelve la lista de respuestas a enviar:
- *   {type:'text', text} | {type:'video'|'document'|'image', path, caption, fileName, mimetype, bytes, note}
- * `dir` es un directorio de trabajo exclusivo para esta petición.
+ * Procesa un texto con link y devuelve la lista de respuestas a enviar.
+ * Compatible con `buildReplies(text, dir)` y con `buildReplies(text, dir, { mode, trim, linkOverride })`.
  */
-export async function buildReplies(text, dir) {
-  const link = parseLink(text);
+export async function buildReplies(text, dir, options = {}) {
+  const cmd = parseMessageCommand(text);
+  const link = options.linkOverride || cmd.links[0] || parseLink(text);
+  const mode = options.mode || cmd.mode || 'video';
+  const trim = options.trim !== undefined ? options.trim : cmd.trim;
+
   if (!link) return [];
   if (link.kind === 'unsupported') {
-    return [{ type: 'text', text: '🤷 Link no soportado. Solo YouTube y X (tweets).' }];
+    return [
+      {
+        type: 'text',
+        text: '🤷 Link no soportado. Plataformas compatibles: YouTube, X (tweets), Instagram, TikTok y Reddit.',
+      },
+    ];
   }
+
   await fs.mkdir(dir, { recursive: true });
   let meta;
   try {
-    meta = await HANDLERS[link.kind](link.url, dir, link);
+    meta = await HANDLERS[link.kind](link.url, dir, link, { mode, trim });
   } catch (e) {
-    const msg = e instanceof UserError ? e.message : `error inesperado: ${truncate(String(e.message || e), 120)}`;
-    return [{ type: 'text', text: `⚠️ No pude procesar el link: ${msg}.` }];
+    const msg = e instanceof UserError ? e.message : `error inesperado: ${truncate(String(e.message || e), 140)}`;
+    return [{ type: 'text', text: `⚠️ No pude procesar el link (${link.kind}): ${msg}.` }];
   }
 
   const replies = [];
   const caption = buildCaption(meta);
   const m = meta.media;
   if (m && m.as !== 'none') {
+    const replyType = m.as === 'document' ? 'document' : m.as === 'audio' ? 'audio' : m.kind || 'video';
+    const ext = replyType === 'audio' ? 'mp3' : replyType === 'image' ? 'jpg' : 'mp4';
     replies.push({
-      type: m.as === 'document' ? 'document' : m.kind || 'video',
+      type: replyType,
       path: m.path,
       bytes: m.bytes,
       note: m.note,
       caption,
-      fileName: m.fileName || `${link.kind}-${path.basename(dir)}.mp4`,
-      mimetype: m.mimetype || 'video/mp4',
+      fileName: m.fileName || `${link.kind}-${path.basename(dir)}.${ext}`,
+      mimetype: m.mimetype || (replyType === 'audio' ? 'audio/mpeg' : 'video/mp4'),
+      meta: {
+        platform: meta.platform,
+        title: meta.title,
+        byline: meta.byline,
+        likes: meta.likes,
+      },
     });
   } else {
-    // sin media: el texto/likes igual se mandan
-    replies.push({ type: 'text', text: caption });
+    replies.push({
+      type: 'text',
+      text: caption,
+      meta: {
+        platform: meta.platform,
+        title: meta.title,
+        byline: meta.byline,
+        likes: meta.likes,
+      },
+    });
     if (m?.note) meta.notices.push(m.note);
   }
-  for (const [i, im] of (meta.moreImages || []).entries()) {
-    replies.push({ type: 'image', path: im.path, bytes: im.bytes, note: `foto ${i + 2}/${meta.moreImages.length + 1}`, caption: '', fileName: `photo${i + 2}.jpg`, mimetype: 'image/jpeg' });
-  }
-  for (const n of meta.notices) replies.push({ type: 'text', text: `ℹ️ ${n}` });
 
-  replies.push({ type: 'text', text: buildCommentsText(meta.comments) ?? `💬 Sin comentarios disponibles.${meta.commentsNote ? ' ' + meta.commentsNote : ''}` });
+  for (const [i, im] of (meta.moreImages || []).entries()) {
+    replies.push({
+      type: 'image',
+      path: im.path,
+      bytes: im.bytes,
+      note: `foto ${i + 2}/${meta.moreImages.length + 1}`,
+      caption: '',
+      fileName: `photo${i + 2}.jpg`,
+      mimetype: 'image/jpeg',
+    });
+  }
+
+  for (const n of meta.notices) {
+    replies.push({ type: 'text', text: `ℹ️ ${n}` });
+  }
+
+  const topComments = extractTopComments(meta.comments);
+  replies.push({
+    type: 'text',
+    text:
+      buildCommentsText(meta.comments) ??
+      `💬 Sin comentarios disponibles.${meta.commentsNote ? ' ' + meta.commentsNote : ''}`,
+    comments: topComments,
+  });
+
   return replies;
 }
 
-const HANDLERS = { youtube: handleYouTube, x: handleX };
+const HANDLERS = {
+  youtube: handleYouTube,
+  x: handleX,
+  instagram: handleGenericYtdlp,
+  tiktok: handleGenericYtdlp,
+  reddit: handleGenericYtdlp,
+};
+
 export { UserError, ytdlp, fmtNum, truncate, probe };

@@ -1,6 +1,9 @@
 .env
 auth/
 out/
+dist/
+.bot-config.json
+.cookies.txt
 node_modules/
 *.log
 *.zip
