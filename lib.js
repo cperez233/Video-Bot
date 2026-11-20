@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 
 const exec = promisify(execFile);
 
@@ -70,6 +71,23 @@ export function isAllowedSender({ allowed, jids, ownId, fromMe }) {
   const nums = jids.filter((j) => j && !String(j).endsWith('@lid')).map(normalizePhone);
   if (!nums.some((n) => allowed.has(n))) return false;
   return fromMe ? nums.includes(normalizePhone(ownId)) : true;
+}
+
+/**
+ * Registro de los mensajes que envía el propio bot. Sirve para ignorarlos al volver como eventos
+ * (en el chat "mensaje a mí mismo" llegan como mensajes propios; si traían un link, el bot se respondería solo).
+ */
+export function createSentTracker(max = 1000) {
+  const ids = new Set();
+  return {
+    newId() {
+      const id = '3EB0' + randomBytes(14).toString('hex').toUpperCase();
+      ids.add(id);
+      if (ids.size > max) ids.delete(ids.values().next().value);
+      return id;
+    },
+    has: (id) => ids.has(id),
+  };
 }
 
 // ───────────────────────── Utilidades ─────────────────────────

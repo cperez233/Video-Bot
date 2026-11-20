@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildReplies, parseLink, normalizePhone, isAllowedSender } from './lib.js';
+import { buildReplies, parseLink, normalizePhone, isAllowedSender, createSentTracker } from './lib.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -53,6 +53,10 @@ if (!allowed.size) {
 const AUTH_DIR = path.join(ROOT, 'auth');
 const digits = normalizePhone;
 
+const sent = createSentTracker();
+/** sendMessage que marca el ID del mensaje como propio, para no procesar nuestras propias respuestas. */
+const send = (sock, jid, content, opts = {}) => sock.sendMessage(jid, content, { ...opts, messageId: sent.newId() });
+
 let queue = Promise.resolve(); // una petición a la vez: evita rate limits y saturar ffmpeg
 
 async function start() {
@@ -67,7 +71,10 @@ async function start() {
       console.log('\nEscanea este QR desde WhatsApp (número secundario) → Dispositivos vinculados:\n');
       qrcode.generate(qr, { small: true });
     }
-    if (connection === 'open') console.log(`✅ Conectado como ${digits(sock.user?.id)}. Whitelist: ${[...allowed].join(', ')}`);
+    if (connection === 'open') {
+      console.log(`✅ Conectado como ${digits(sock.user?.id)}. Whitelist: ${[...allowed].join(', ')}`);
+      if (allowed.has(digits(sock.user?.id))) console.log('ℹ️ Modo un solo número: escríbete a ti mismo (chat "Message yourself") para usar el bot.');
+    }
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
@@ -95,6 +102,7 @@ async function start() {
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
+      if (sent.has(msg.key.id)) continue; // respuesta del propio bot
       queue = queue.then(() => handle(sock, msg, isAuthorized, normalizeMessageContent)).catch((e) => console.error('handle:', e));
     }
   });
@@ -107,22 +115,22 @@ async function handle(sock, msg, isAuthorized, normalize) {
   if (!(await isAuthorized(msg))) return; // lista blanca: silencio total para el resto
 
   const jid = msg.key.remoteJid;
-  const react = (emoji) => sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }).catch(() => {});
+  const react = (emoji) => send(sock, jid, { react: { text: emoji, key: msg.key } }).catch(() => {});
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'wabot-'));
   try {
     await react('⏳');
     const replies = await buildReplies(text, dir);
     for (const r of replies) {
-      if (r.type === 'text') await sock.sendMessage(jid, { text: r.text }, { quoted: msg });
-      else if (r.type === 'video') await sock.sendMessage(jid, { video: { url: r.path }, mimetype: 'video/mp4', caption: r.caption }, { quoted: msg });
-      else if (r.type === 'image') await sock.sendMessage(jid, { image: { url: r.path }, ...(r.caption ? { caption: r.caption } : {}) }, { quoted: msg });
-      else if (r.type === 'document') await sock.sendMessage(jid, { document: { url: r.path }, mimetype: r.mimetype, fileName: r.fileName, caption: r.caption }, { quoted: msg });
+      if (r.type === 'text') await send(sock, jid, { text: r.text }, { quoted: msg });
+      else if (r.type === 'video') await send(sock, jid, { video: { url: r.path }, mimetype: 'video/mp4', caption: r.caption }, { quoted: msg });
+      else if (r.type === 'image') await send(sock, jid, { image: { url: r.path }, ...(r.caption ? { caption: r.caption } : {}) }, { quoted: msg });
+      else if (r.type === 'document') await send(sock, jid, { document: { url: r.path }, mimetype: r.mimetype, fileName: r.fileName, caption: r.caption }, { quoted: msg });
     }
     await react('✅');
   } catch (e) {
     console.error('envío falló:', e);
     await react('❌');
-    await sock.sendMessage(jid, { text: '⚠️ Falló el envío por WhatsApp.' }, { quoted: msg }).catch(() => {});
+    await send(sock, jid, { text: '⚠️ Falló el envío por WhatsApp.' }, { quoted: msg }).catch(() => {});
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

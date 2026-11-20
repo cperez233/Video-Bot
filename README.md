@@ -61,11 +61,27 @@ Probar sin WhatsApp (imprime lo que enviaría y deja los archivos en `out/`):
 node bot.js --dry-run https://x.com/usuario/status/123456789
 ```
 
+## Números de otros países y modo "un solo número"
+
+`ALLOWED_NUMBERS` va **solo con dígitos y el código de país**, sin `+`, espacios ni guiones:
+
+| País | Número | Se escribe |
+|---|---|---|
+| EE. UU. / Canadá | +1 555 123 4567 | `15551234567` |
+| Colombia | +57 300 123 4567 | `573001234567` |
+| México | +52 33 1234 5678 | `523312345678` |
+
+**Con dos números (recomendado):** vincula el número secundario con el QR y escríbele desde tu número personal.
+
+**Con un solo número:** escanea el QR con tu propia cuenta, pon **tu propio número** en `ALLOWED_NUMBERS` y manda los links al chat "Message yourself" (mensaje a ti mismo). El bot ignora sus propias respuestas, así que no se responde en bucle.
+
+> Este modo no está probado con WhatsApp real. Además, Baileys usa WhatsApp Web de forma no oficial y WhatsApp puede suspender las cuentas que lo hacen: con tu número principal arriesgas esa cuenta. Por eso se recomienda un número secundario.
+
 ## Configuración (`.env`)
 
 | Variable | Descripción |
 |---|---|
-| `ALLOWED_NUMBERS` | **Obligatoria.** Números autorizados, solo dígitos con código de país, separados por coma (ej. Colombia: `573001234567`) |
+| `ALLOWED_NUMBERS` | **Obligatoria.** Números autorizados, solo dígitos con código de país, separados por coma (ej. EE. UU.: `15551234567`) |
 | `MAX_DURATION_MIN` | Duración máxima de video a descargar (por defecto 20) |
 | `MAX_DOC_MB` | Tamaño máximo para enviar como documento (por defecto 100) |
 | `YTDLP_COOKIES` | Ruta a un `cookies.txt` si YouTube pide verificar que no eres bot |
